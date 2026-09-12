@@ -1,4 +1,4 @@
-# Comm-Log Reconciliation : Data Dictionary
+# Comm-Log Reconciliation — Data Dictionary
 
 This is the raw data for the take-home in `ASSIGNMENT.md`. Everything you need is either
 in the schema below or discoverable by querying the data itself.
