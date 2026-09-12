@@ -1,80 +1,136 @@
-# Comm-Log Reconciliation — Data Dictionary
+# Comm-Log Send Reconciliation — Submission
 
-This is the raw data for the take-home in `ASSIGNMENT.md`. Everything you need is either
-in the schema below or discoverable by querying the data itself.
+## Reconnaissance
 
-## Loading the data
+I read the README and the assignment PDF. Three rules matter for what counts as a
+qualifying send:
 
-`data/comm_log.db` is a SQLite database with two tables (also available as
-`data/campaign.csv` and `data/communication_log.csv` if you prefer a different tool).
+1. **Eligibility gate** — a campaign only counts once `creation_status` is finalized
+   (approved/aborted/resumed/stopped) and `processing_status = 'processed'`.
+   `approval_awaiting` campaigns don't count, even if sends already exist for them.
+2. **Retry chains count once per customer** — `parent_id` links a campaign to the one
+   it's retrying. A chain (A → B → C) is one underlying communication, re-attempted.
+   A customer reached anywhere in that chain counts once, not once per attempt.
+3. **Standalone campaigns don't dedupe** — a campaign with no parent and no retries
+   pointing at it is independent. Every send under it counts, even if the same
+   customer appears more than once.
 
+## Naive baseline
+
+```sql
+SELECT COUNT(*)
+FROM communication_log cl
+JOIN campaign c ON cl.communication_id = c.id
+WHERE cl.merchant_id = 501
+  AND c.name LIKE '%Diwali%'
+  AND cl.sent_time >= '2026-10-01 00:00:00'
+  AND cl.sent_time < '2026-11-01 00:00:00';
 ```
-sqlite3 data/comm_log.db
-.tables
-.schema campaign
-.schema communication_log
+
+Result: 30. Finance's target is 22 — an 8-row gap.
+
+## Investigating the gap
+
+Checked merchant scope and campaign names first — no issue, all 7 campaigns belong
+to 501 and are Diwali campaigns. Checked `sent_time` vs `scheduled_time` — identical
+across all rows, so no date issue either.
+
+Campaign 9004 turned out to be `approval_awaiting`, even though it already has 4
+log rows. Per the README, it doesn't count toward reporting yet. Excluding it:
+30 → 26.
+
+My first instinct after that was `COUNT(DISTINCT customer_id)`. That gave 21, not
+22 — one short. Digging in, customer C20 appears twice under campaign 9101, a
+standalone campaign with no retry chain. Those are two separate, legitimate sends,
+not a retry — so they shouldn't be collapsed. Global distinct-customer counting
+can't tell a retry-chain repeat from a standalone repeat, so it wrongly collapses
+both. The fix isn't "dedupe everything" — it's dedupe only within retry chains,
+and leave standalone campaigns alone.
+
+I also considered just filtering to `delivery_status = 900` and counting rows,
+which also gives 22 on this dataset. But it works here only because no customer in
+either retry chain happens to have two delivered rows. If that ever happened (e.g.
+a duplicate delivery confirmation), this filter would double-count them, while the
+"one count per customer per chain" rule wouldn't. So I built the chain-aware
+version below instead of relying on that coincidence.
+
+## Grouping by retry chain
+
+- **Chain 9001 → 9002 → 9003** (13 raw rows): C1 and C4–C10 delivered on the first
+  try; C2 delivered on the retry; C3 delivered on the second retry. → 10 distinct
+  customers reached.
+- **Chain 9201 → 9202** (6 raw rows): D2–D5 delivered first try, D1 delivered on
+  retry. → 5 distinct customers reached.
+- **Standalone 9101** (7 raw rows, no chain): C20 (twice), C21–C25. No dedup — all
+  7 count.
+
+10 + 5 + 7 = 22.
+![result image](result.png)
+## Reconciliation bridge
+
+| Step | Description | Result | Delta | Reason |
+|---|---|---|---|---|
+| 0 | Naive count | 30 | — | Starting point |
+| 1 | Exclude campaign 9004 (approval_awaiting) | 26 | -4 | Not finalized for reporting per README |
+| 2 | Count once per customer within each retry chain | 22 | -4 | A chain is one communication, re-attempted — repeat attempts aren't separate sends |
+| 3 | Confirm standalone campaign 9101 is *not* deduped | 22 | 0 | No chain = every send is its own event; global dedup would wrongly give 21 |
+| final | | **22** | | Matches Finance's target_base |
+
+## Final SQL
+
+A recursive CTE is needed since chains can be more than one level deep, and the
+counting rule (dedupe vs. no dedupe) depends on which family a campaign belongs to.
+
+```sql
+WITH RECURSIVE
+eligible_campaigns AS (
+    SELECT id, parent_id
+    FROM campaign
+    WHERE merchant_id = 501
+      AND name LIKE '%Diwali%'
+      AND creation_status IN ('approved', 'aborted', 'resumed', 'stopped')
+      AND processing_status = 'processed'
+),
+campaign_hierarchy AS (
+    SELECT id AS campaign_id, id AS root_campaign_id
+    FROM eligible_campaigns
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT ec.id, ch.root_campaign_id
+    FROM eligible_campaigns ec
+    JOIN campaign_hierarchy ch ON ec.parent_id = ch.campaign_id
+),
+family_stats AS (
+    SELECT campaign_id, root_campaign_id,
+           COUNT(*) OVER (PARTITION BY root_campaign_id) AS family_size
+    FROM campaign_hierarchy
+),
+qualifying_sends AS (
+    SELECT cl.id, cl.customer_id, fs.root_campaign_id, fs.family_size
+    FROM communication_log cl
+    JOIN family_stats fs ON cl.communication_id = fs.campaign_id
+    WHERE cl.merchant_id = 501
+      AND cl.communication_type = '2'
+      AND cl.delivery_status = 900
+      AND cl.sent_time >= '2026-10-01 00:00:00'
+      AND cl.sent_time <  '2026-11-01 00:00:00'
+)
+SELECT
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT root_campaign_id, customer_id
+        FROM qualifying_sends WHERE family_size > 1
+    ))
+    +
+    (SELECT COUNT(*) FROM qualifying_sends WHERE family_size = 1)
+    AS target_base;
 ```
 
-## Table: `campaign`
+Returns 22.
 
-One row per campaign. A campaign can be a **retry** of an earlier campaign — this is
-how the system represents "we re-sent to customers who didn't respond/failed on a
-previous attempt."
+## What surprised me
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | int | Campaign id. |
-| `merchant_id` | int | Owning merchant. |
-| `parent_id` | int, nullable | If set, this campaign is a retry attempt of `parent_id`. NULL means this campaign was not created as a retry of anything (it may still have its own retries pointing at it). |
-| `name` | text | Human-readable label. |
-| `creation_status` | text | Lifecycle state of the campaign's *creation/approval* workflow. Values seen in this dataset: `approved`, `approval_awaiting`. Other real values include `aborted`, `resumed`, `stopped` (all of these, plus `approved`, are considered finalized/live for reporting purposes). `approval_awaiting` means the campaign has not cleared approval yet. |
-| `processing_status` | text | Lifecycle state of the campaign's *send* workflow. `processed` means the send pipeline has finished running for this campaign. |
-
-**A campaign is included in official reporting only once both its creation workflow
-has cleared (`creation_status` in the finalized set above) and its processing has
-completed (`processing_status = 'processed'`).** A campaign still `approval_awaiting`
-has not been signed off and does not count toward reported sends, even if
-`communication_log` rows already exist for it (the send pipeline can run ahead of
-approval bookkeeping catching up).
-
-## Table: `communication_log`
-
-One row per individual send attempt.
-
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | int | Row id (one per send attempt). |
-| `merchant_id` | int | Owning merchant. |
-| `communication_id` | int | FK to `campaign.id` — which campaign this attempt belongs to. |
-| `customer_id` | text | Customer targeted. |
-| `communication_type` | text | `'2'` = Campaign (the only type in this dataset). |
-| `delivery_status` | int | `900` = delivered successfully. `1100` = failed (soft failure — the customer may be retried via a new campaign row, or genuinely re-targeted later). |
-| `sent_time` / `scheduled_time` | timestamp | When the send happened / was scheduled. |
-| `credit_used` | int | Billing credits consumed by this attempt. |
-| `channel` | text | Send channel (`sms` throughout this dataset). |
-
-**A customer can legitimately appear more than once against the same `communication_id`.**
-This happens when a campaign is independently re-run or a customer is re-targeted after
-falling back into the audience — it is a separate event from a *retry*, which always
-creates a **new** campaign row (`campaign.parent_id` pointing back at the original).
-
-## Retry chains
-
-If campaign B has `parent_id = A`, B represents "the same underlying communication,
-re-attempted." A chain can be more than two levels deep (A -> B -> C). A customer who
-was sent A (and failed), then B (and failed), then C (and delivered) was targeted by
-the *same underlying communication* three times — not three independent communications.
-
-## What "reporting" considers a qualifying send
-
-Finance's `target_base` metric answers: **for a given underlying communication (a
-campaign plus every retry chained off it), how many distinct customers were reached?**
-A customer who took several attempts within one retry chain to finally get delivered
-still counts once. A campaign with no retry chain at all (no other campaign points at
-it, and it points at nothing) is a standalone communication — every send under it is
-its own event, whether or not the same customer appears twice.
-
-## Scope for this exercise
-
-All data is for `merchant_id = 501`, sends in October 2026, `communication_type = '2'`
-(Campaign) only.
+The most interesting thing wasn't the final number — it's that two different
+queries can both return 22 on this dataset for completely different reasons, and
+only one of them is actually correct. A flat `delivery_status = 900` filter gets
+the right number by accident here; it would break silently on a slightly different
+dataset. I hadn't expected a 30-row toy dataset to hide that distinction so well.
